@@ -38,6 +38,40 @@ from tqdm import trange
 from matplotlib import colormaps
 
 
+def generate_yaw_points(num_rot: int, device='cpu'):
+    yaw_arr = torch.arange(num_rot, dtype=torch.float, device=device)
+    yaw_arr = yaw_arr * 2 * np.pi / num_rot
+
+    return yaw_arr
+
+
+def yaw2rot_mtx(yaw_arr: torch.Tensor, apply_xz_flip=False):
+    # Initialize rotation matrices from yaw values
+    def _yaw2mtx(yaw):
+        # yaw is assumed to be a scalar
+        yaw = yaw.reshape(1, )
+
+        tensor_0 = torch.zeros(1, device=yaw.device)
+        tensor_1 = torch.ones(1, device=yaw.device)
+
+        R = torch.stack([
+            torch.stack([torch.cos(yaw), tensor_0, -torch.sin(yaw)]),
+            torch.stack([tensor_0, tensor_1, tensor_0]),
+            torch.stack([torch.sin(yaw), tensor_0, torch.cos(yaw)])
+        ]).reshape(3, 3)
+
+        return R
+
+    tot_mtx = []
+    for yaw in yaw_arr:
+        if apply_xz_flip:
+            tot_mtx.append(_yaw2mtx(yaw))
+            tot_mtx.append(_yaw2mtx(yaw) @ np.array([[-1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]))  # X flip (Z flip is subsumed by X flip + rotation)
+        else:
+            tot_mtx.append(_yaw2mtx(yaw))
+    return torch.stack(tot_mtx)
+
+
 def check_in_polygon(poly_points: np.ndarray, query_points: np.ndarray):
     # poly_points are floorplan points arranged clockwise
     valid_poly_points = poly_points[poly_points.sum(-1) != np.inf]
@@ -248,6 +282,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_floor_points", help="Number of floor points for extracting sonata features", default=0, type=int)
     parser.add_argument("--feat_sample_points", type=int, help="Number of points to sample per object model for feature extraction", default=2048)
     parser.add_argument("--normalize_feats", help="If True, normalize network outputs to unit norm", action="store_true")
+    parser.add_argument("--rot_aug", help="Number of uniformly sampled y-axis (height-axis) rotations for feature averaging", default=1, type=int)
+    parser.add_argument("--flip_aug", help="If True, apply flip augmentations and average them for feature extraction", action="store_true")
 
     # Visualization configs
     parser.add_argument("--vis_margin", help="Amount of margins to apply for reference scene during visualization", default=10., type=float)
@@ -345,50 +381,86 @@ if __name__ == "__main__":
                     "normal": np.asarray(o3d_pcd.normals)
                 }
 
-        global_data = transform(global_data)
-        local_data = transform(local_data)
+        # Obtain list of rotation matrices
+        yaw_points = generate_yaw_points(args.rot_aug)
+        rot_matrices = yaw2rot_mtx(yaw_points, apply_xz_flip=args.flip_aug).float().cpu().numpy()
+
+        rot_local_data_list = [
+            {
+                "coord": (local_data["coord"] - local_data["coord"].mean(0, keepdims=True)) @ rot_mtx.T + local_data["coord"].mean(0, keepdims=True),
+                "color": np.copy(local_data["color"]),
+                "normal": local_data["normal"] @ rot_mtx.T
+            } for rot_mtx in rot_matrices
+        ]
+        rot_global_data_list = [
+            {
+                "coord": (global_data["coord"] - global_data["coord"].mean(0, keepdims=True)) @ rot_mtx.T + global_data["coord"].mean(0, keepdims=True),
+                "color": np.copy(global_data["color"]),
+                "normal": global_data["normal"] @ rot_mtx.T
+            } for rot_mtx in rot_matrices
+        ]
 
         # model forward:
+        rot_local_point_list = []
+        rot_global_point_list = []
         with torch.inference_mode():
-            for key in global_data.keys():
-                if isinstance(global_data[key], torch.Tensor):
-                    global_data[key] = global_data[key].cuda(non_blocking=True)
-            for key in local_data.keys():
-                if isinstance(local_data[key], torch.Tensor):
-                    local_data[key] = local_data[key].cuda(non_blocking=True)
-            global_point = model(global_data)
-            local_point = model(local_data)
-            # upcast point feature
-            # Point is a structure contains all the information during forward
-            for _ in range(2):
-                assert "pooling_parent" in global_point.keys()
-                assert "pooling_inverse" in global_point.keys()
-                parent = global_point.pop("pooling_parent")
-                inverse = global_point.pop("pooling_inverse")
-                parent.feat = torch.cat([parent.feat, global_point.feat[inverse]], dim=-1)
-                global_point = parent
-            while "pooling_parent" in global_point.keys():
-                assert "pooling_inverse" in global_point.keys()
-                parent = global_point.pop("pooling_parent")
-                inverse = global_point.pop("pooling_inverse")
-                parent.feat = global_point.feat[inverse]
-                global_point = parent
-            for _ in range(2):
-                assert "pooling_parent" in local_point.keys()
-                assert "pooling_inverse" in local_point.keys()
-                parent = local_point.pop("pooling_parent")
-                inverse = local_point.pop("pooling_inverse")
-                parent.feat = torch.cat([parent.feat, local_point.feat[inverse]], dim=-1)
-                local_point = parent
-            while "pooling_parent" in local_point.keys():
-                assert "pooling_inverse" in local_point.keys()
-                parent = local_point.pop("pooling_parent")
-                inverse = local_point.pop("pooling_inverse")
-                parent.feat = local_point.feat[inverse]
-                local_point = parent
+            for rot_local_data, rot_global_data in zip(rot_local_data_list, rot_global_data_list):
+                rot_global_data = transform(rot_global_data)
+                rot_local_data = transform(rot_local_data)
+
+                for key in rot_global_data.keys():
+                    if isinstance(rot_global_data[key], torch.Tensor):
+                        rot_global_data[key] = rot_global_data[key].cuda(non_blocking=True)
+                for key in rot_local_data.keys():
+                    if isinstance(rot_local_data[key], torch.Tensor):
+                        rot_local_data[key] = rot_local_data[key].cuda(non_blocking=True)
+                rot_global_point = model(rot_global_data)
+                rot_local_point = model(rot_local_data)
+                # upcast point feature
+                # Point is a structure contains all the information during forward
+                for _ in range(2):
+                    assert "pooling_parent" in rot_global_point.keys()
+                    assert "pooling_inverse" in rot_global_point.keys()
+                    parent = rot_global_point.pop("pooling_parent")
+                    inverse = rot_global_point.pop("pooling_inverse")
+                    parent.feat = torch.cat([parent.feat, rot_global_point.feat[inverse]], dim=-1)
+                    rot_global_point = parent
+                while "pooling_parent" in rot_global_point.keys():
+                    assert "pooling_inverse" in rot_global_point.keys()
+                    parent = rot_global_point.pop("pooling_parent")
+                    inverse = rot_global_point.pop("pooling_inverse")
+                    parent.feat = rot_global_point.feat[inverse]
+                    rot_global_point = parent
+                for _ in range(2):
+                    assert "pooling_parent" in rot_local_point.keys()
+                    assert "pooling_inverse" in rot_local_point.keys()
+                    parent = rot_local_point.pop("pooling_parent")
+                    inverse = rot_local_point.pop("pooling_inverse")
+                    parent.feat = torch.cat([parent.feat, rot_local_point.feat[inverse]], dim=-1)
+                    rot_local_point = parent
+                while "pooling_parent" in rot_local_point.keys():
+                    assert "pooling_inverse" in rot_local_point.keys()
+                    parent = rot_local_point.pop("pooling_parent")
+                    inverse = rot_local_point.pop("pooling_inverse")
+                    parent.feat = rot_local_point.feat[inverse]
+                    rot_local_point = parent
+                rot_local_point_list.append(rot_local_point)
+                rot_global_point_list.append(rot_global_point)
+
+            # Aggregate augmented results
+            local_point_coord = rot_local_point_list[0].coord[rot_local_point_list[0].inverse]
+            global_point_coord = rot_global_point_list[0].coord[rot_global_point_list[0].inverse]
+            local_point_offset = local_point_coord.shape[0]
+            global_point_offset = global_point_coord.shape[0]
+
+            full_local_point_feat = torch.stack([rot_local_point.feat[rot_local_point.inverse] for rot_local_point in rot_local_point_list], dim=0)
+            full_global_point_feat = torch.stack([rot_global_point.feat[rot_global_point.inverse] for rot_global_point in rot_global_point_list], dim=0)
+
+            local_point_feat = full_local_point_feat.mean(0)
+            global_point_feat = full_global_point_feat.mean(0)
 
             # Get point orderings
-            local_points = local_point.coord.cpu().numpy()
+            local_points = local_point_coord.cpu().numpy()
             sort_dt = np.dtype([('x', local_points.dtype), ('y', local_points.dtype), ('z', local_points.dtype)])
             local_points_for_sort = np.zeros(local_points.shape[0], dtype=sort_dt)
             local_points_for_sort['x'] = local_points[:, 0]
@@ -407,11 +479,11 @@ if __name__ == "__main__":
                 select_index = [[view_index]]
 
                 if args.normalize_feats:
-                    target = F.normalize(local_point.feat, p=2, dim=-1)
-                    refer = F.normalize(global_point.feat, p=2, dim=-1)
+                    target = F.normalize(local_point_feat, p=2, dim=-1)
+                    refer = F.normalize(global_point_feat, p=2, dim=-1)
                 else:
-                    target = local_point.feat.clone().detach()
-                    refer = global_point.feat.clone().detach()
+                    target = local_point_feat.clone().detach()
+                    refer = global_point_feat.clone().detach()
 
                 if args.colorize_method == "dist":
                     dist_self = (target[select_index] - target).norm(dim=-1).reshape(-1)  # (N_unif, )
@@ -436,9 +508,9 @@ if __name__ == "__main__":
                     reject = 0.5
                     cmap = plt.get_cmap("Spectral_r")
                     sorted_inner = torch.sort(inner_cross, descending=True)[0]
-                    oral = sorted_inner[0, int(global_point.offset[0] * oral)]
-                    highlight = sorted_inner[0, int(global_point.offset[0] * highlight)]
-                    reject = sorted_inner[0, -int(global_point.offset[0] * reject)]
+                    oral = sorted_inner[0, int(global_point_offset * oral)]
+                    highlight = sorted_inner[0, int(global_point_offset * highlight)]
+                    reject = sorted_inner[0, -int(global_point_offset * reject)]
 
                     inner_self = inner_self - highlight
                     inner_self[inner_self > 0] = F.sigmoid(
@@ -464,7 +536,7 @@ if __name__ == "__main__":
                 # shift local view from global view
                 bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
                 pcds = get_point_cloud(
-                    coord=[global_point.coord, local_point.coord + bias],
+                    coord=[global_point_coord, local_point_coord + bias],
                     color=[global_heat_color, local_heat_color],
                     verbose=False,
                 )
@@ -472,8 +544,8 @@ if __name__ == "__main__":
                     get_line_set(
                         coord=torch.cat(
                             [
-                                local_point.coord[select_index] + bias,
-                                global_point.coord[matched_index.unsqueeze(0)],
+                                local_point_coord[select_index] + bias,
+                                global_point_coord[matched_index.unsqueeze(0)],
                             ]
                         ),
                         line=np.array([[0, 1]]),
@@ -483,13 +555,13 @@ if __name__ == "__main__":
                 )
 
                 global_match_pcd = o3d.geometry.PointCloud()
-                global_match_pcd.points = o3d.utility.Vector3dVector((global_point.coord[matched_index.unsqueeze(0)]).cpu().numpy())
+                global_match_pcd.points = o3d.utility.Vector3dVector((global_point_coord[matched_index.unsqueeze(0)]).cpu().numpy())
                 global_match_pcd.paint_uniform_color((1., 0., 1.))
                 global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.2)
                 pcds.append(global_match_mesh)
 
                 local_match_pcd = o3d.geometry.PointCloud()
-                local_match_pcd.points = o3d.utility.Vector3dVector((local_point.coord[select_index] + bias).cpu().numpy())
+                local_match_pcd.points = o3d.utility.Vector3dVector((local_point_coord[select_index] + bias).cpu().numpy())
                 local_match_pcd.paint_uniform_color((1., 0., 1.))
                 local_match_mesh = keypoints_to_spheres(local_match_pcd, radius=0.2)
                 pcds.append(local_match_mesh)
