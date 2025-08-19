@@ -31,11 +31,51 @@ try:
 except ImportError:
     flash_attn = None
 import math
-from typing import Union, Tuple
+from typing import Union, Tuple, List
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 from tqdm import trange
 from matplotlib import colormaps
+
+
+def choice_without_replacement(l: Union[List, np.array], n, return_idx=False):
+    if isinstance(l, list):
+        idx_list = np.random.permutation(len(l))[:n].tolist()
+        choice_list = [l[idx] for idx in idx_list]
+
+        if return_idx:
+            return choice_list, idx_list
+        else:
+            return choice_list
+    elif isinstance(l, np.ndarray):
+        idx_arr = np.random.permutation(len(l))[:n]
+        choice_arr = l[idx_arr]
+
+        if return_idx:
+            return choice_arr, idx_arr
+        else:
+            return choice_arr
+    else:
+        raise ValueError("Invalid input type")
+
+
+def farthest_point_down_sample(points_np: np.array, n, return_idx=False, max_input_size=10000):
+    if max_input_size != -1:  # First random sample to designated size
+        in_points_np, in_idx_np = choice_without_replacement(points_np, max_input_size, return_idx=True)
+    else:
+        in_points_np, in_idx_np = points_np, np.arange(points_np.shape[0])
+
+    pcd = o3d.geometry.PointCloud()
+    in_idx_np = np.stack([in_idx_np.astype(float)] * 3, axis=-1)  # (N, 3)
+    pcd.points = o3d.utility.Vector3dVector(in_points_np)
+    pcd.colors = o3d.utility.Vector3dVector(in_idx_np)
+    pcd = pcd.farthest_point_down_sample(n)
+
+    if return_idx:
+        idx_np = np.asarray(pcd.colors)[:, 0].astype(int).tolist()
+        return np.asarray(pcd.points), idx_np
+    else:
+        return np.asarray(pcd.points)
 
 
 def generate_yaw_points(num_rot: int, device='cpu'):
@@ -284,6 +324,7 @@ if __name__ == "__main__":
     parser.add_argument("--normalize_feats", help="If True, normalize network outputs to unit norm", action="store_true")
     parser.add_argument("--rot_aug", help="Number of uniformly sampled y-axis (height-axis) rotations for feature averaging", default=1, type=int)
     parser.add_argument("--flip_aug", help="If True, apply flip augmentations and average them for feature extraction", action="store_true")
+    parser.add_argument("--mutual_nn_sample_rate", help="Downsampling rate for mutual NN computation", default=0.01, type=float)
 
     # Visualization configs
     parser.add_argument("--vis_margin", help="Amount of margins to apply for reference scene during visualization", default=10., type=float)
@@ -292,6 +333,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_vis", help="Save point cloud used for visualization", action="store_true")
     parser.add_argument("--vis_gamma", help="Gamma value to use for visualization", default=1., type=float)
     parser.add_argument("--colorize_method", help="Method for visualizing feature distances", default="dist", type=str)
+    parser.add_argument("--vis_mode", help="Visualization mode of features", default="feat_dist")
 
     args = parser.parse_args()
 
@@ -450,6 +492,8 @@ if __name__ == "__main__":
             # Aggregate augmented results
             local_point_coord = rot_local_point_list[0].coord[rot_local_point_list[0].inverse]
             global_point_coord = rot_global_point_list[0].coord[rot_global_point_list[0].inverse]
+            local_point_color = local_data["color"]
+            global_point_color = global_data["color"]
             local_point_offset = local_point_coord.shape[0]
             global_point_offset = global_point_coord.shape[0]
 
@@ -459,123 +503,193 @@ if __name__ == "__main__":
             local_point_feat = full_local_point_feat.mean(0)
             global_point_feat = full_global_point_feat.mean(0)
 
-            # Get point orderings
-            local_points = local_point_coord.cpu().numpy()
-            sort_dt = np.dtype([('x', local_points.dtype), ('y', local_points.dtype), ('z', local_points.dtype)])
-            local_points_for_sort = np.zeros(local_points.shape[0], dtype=sort_dt)
-            local_points_for_sort['x'] = local_points[:, 0]
-            local_points_for_sort['y'] = local_points[:, 1]
-            local_points_for_sort['z'] = local_points[:, 2]
-            view_indices = np.argsort(local_points_for_sort, order=['x', 'z', 'y'])
+            if args.vis_mode == "feat_dist":
+                # Get point orderings
+                local_points = local_point_coord.cpu().numpy()
+                sort_dt = np.dtype([('x', local_points.dtype), ('y', local_points.dtype), ('z', local_points.dtype)])
+                local_points_for_sort = np.zeros(local_points.shape[0], dtype=sort_dt)
+                local_points_for_sort['x'] = local_points[:, 0]
+                local_points_for_sort['y'] = local_points[:, 1]
+                local_points_for_sort['z'] = local_points[:, 2]
+                view_indices = np.argsort(local_points_for_sort, order=['x', 'z', 'y'])
 
-            if args.vis_indices is not None:
-                view_indices = view_indices[args.vis_indices]
-            else:
-                view_indices = view_indices[::args.vis_every]
-
-            prev_pcds = []
-
-            for repeat_index, view_index in enumerate(view_indices):
-                select_index = [[view_index]]
-
-                if args.normalize_feats:
-                    target = F.normalize(local_point_feat, p=2, dim=-1)
-                    refer = F.normalize(global_point_feat, p=2, dim=-1)
+                if args.vis_indices is not None:
+                    view_indices = view_indices[args.vis_indices]
                 else:
-                    target = local_point_feat.clone().detach()
-                    refer = global_point_feat.clone().detach()
+                    view_indices = view_indices[::args.vis_every]
 
-                if args.colorize_method == "dist":
-                    dist_self = (target[select_index] - target).norm(dim=-1).reshape(-1)  # (N_unif, )
-                    dist_cross = (target[select_index] - refer).norm(dim=-1).reshape(-1)
-                    max_norm_dist_self = (dist_self - dist_self.min()) / (dist_self.max() - dist_self.min() + 1e-5)
-                    max_norm_dist_self = max_norm_dist_self ** args.vis_gamma
-                    max_norm_dist_self = max_norm_dist_self.cpu().numpy()
-                    local_heat_color = colormaps['jet'](max_norm_dist_self, alpha=False, bytes=False)[:, :3]
+                prev_pcds = []
 
-                    max_norm_dist_cross = (dist_cross - dist_cross.min()) / (dist_cross.max() - dist_cross.min() + 1e-5)
-                    max_norm_dist_cross = max_norm_dist_cross ** args.vis_gamma
-                    max_norm_dist_cross = max_norm_dist_cross.cpu().numpy()
-                    global_heat_color = colormaps['jet'](max_norm_dist_cross, alpha=False, bytes=False)[:, :3]
+                for repeat_index, view_index in enumerate(view_indices):
+                    select_index = [[view_index]]
 
-                    matched_index = torch.argmin(dist_cross)
-                else:  # Sigmoid-based visualization as in Sonata
-                    inner_self = target[select_index] @ target.t()
-                    inner_cross = target[select_index] @ refer.t()
+                    if args.normalize_feats:
+                        target = F.normalize(local_point_feat, p=2, dim=-1)
+                        refer = F.normalize(global_point_feat, p=2, dim=-1)
+                    else:
+                        target = local_point_feat.clone().detach()
+                        refer = global_point_feat.clone().detach()
 
-                    oral = 0.02
-                    highlight = 0.1
-                    reject = 0.5
-                    cmap = plt.get_cmap("Spectral_r")
-                    sorted_inner = torch.sort(inner_cross, descending=True)[0]
-                    oral = sorted_inner[0, int(global_point_offset * oral)]
-                    highlight = sorted_inner[0, int(global_point_offset * highlight)]
-                    reject = sorted_inner[0, -int(global_point_offset * reject)]
+                    if args.colorize_method == "dist":
+                        dist_self = (target[select_index] - target).norm(dim=-1).reshape(-1)  # (N_unif, )
+                        dist_cross = (target[select_index] - refer).norm(dim=-1).reshape(-1)
+                        max_norm_dist_self = (dist_self - dist_self.min()) / (dist_self.max() - dist_self.min() + 1e-5)
+                        max_norm_dist_self = max_norm_dist_self ** args.vis_gamma
+                        max_norm_dist_self = max_norm_dist_self.cpu().numpy()
+                        local_heat_color = colormaps['jet'](max_norm_dist_self, alpha=False, bytes=False)[:, :3]
 
-                    inner_self = inner_self - highlight
-                    inner_self[inner_self > 0] = F.sigmoid(
-                        inner_self[inner_self > 0] / (oral - highlight)
+                        max_norm_dist_cross = (dist_cross - dist_cross.min()) / (dist_cross.max() - dist_cross.min() + 1e-5)
+                        max_norm_dist_cross = max_norm_dist_cross ** args.vis_gamma
+                        max_norm_dist_cross = max_norm_dist_cross.cpu().numpy()
+                        global_heat_color = colormaps['jet'](max_norm_dist_cross, alpha=False, bytes=False)[:, :3]
+
+                        matched_index = torch.argmin(dist_cross)
+                    else:  # Sigmoid-based visualization as in Sonata
+                        inner_self = target[select_index] @ target.t()
+                        inner_cross = target[select_index] @ refer.t()
+
+                        oral = 0.02
+                        highlight = 0.1
+                        reject = 0.5
+                        cmap = plt.get_cmap("Spectral_r")
+                        sorted_inner = torch.sort(inner_cross, descending=True)[0]
+                        oral = sorted_inner[0, int(global_point_offset * oral)]
+                        highlight = sorted_inner[0, int(global_point_offset * highlight)]
+                        reject = sorted_inner[0, -int(global_point_offset * reject)]
+
+                        inner_self = inner_self - highlight
+                        inner_self[inner_self > 0] = F.sigmoid(
+                            inner_self[inner_self > 0] / (oral - highlight)
+                        )
+                        inner_self[inner_self < 0] = (
+                            F.sigmoid(inner_self[inner_self < 0] / (highlight - reject)) * 0.9
+                        )
+
+                        inner_cross = inner_cross - highlight
+                        inner_cross[inner_cross > 0] = F.sigmoid(
+                            inner_cross[inner_cross > 0] / (oral - highlight)
+                        )
+                        inner_cross[inner_cross < 0] = (
+                            F.sigmoid(inner_cross[inner_cross < 0] / (highlight - reject)) * 0.9
+                        )
+
+                        matched_index = torch.argmax(inner_cross)
+
+                        local_heat_color = cmap(inner_self.squeeze(0).cpu().numpy())[:, :3]
+                        global_heat_color = cmap(inner_cross.squeeze(0).cpu().numpy())[:, :3]
+
+                    # shift local view from global view
+                    bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
+                    pcds = get_point_cloud(
+                        coord=[global_point_coord, local_point_coord + bias],
+                        color=[global_heat_color, local_heat_color],
+                        verbose=False,
                     )
-                    inner_self[inner_self < 0] = (
-                        F.sigmoid(inner_self[inner_self < 0] / (highlight - reject)) * 0.9
+                    pcds.append(
+                        get_line_set(
+                            coord=torch.cat(
+                                [
+                                    local_point_coord[select_index] + bias,
+                                    global_point_coord[matched_index.unsqueeze(0)],
+                                ]
+                            ),
+                            line=np.array([[0, 1]]),
+                            color=np.array([0, 0, 0]) / 255,
+                            verbose=False,
+                        )
                     )
 
-                    inner_cross = inner_cross - highlight
-                    inner_cross[inner_cross > 0] = F.sigmoid(
-                        inner_cross[inner_cross > 0] / (oral - highlight)
-                    )
-                    inner_cross[inner_cross < 0] = (
-                        F.sigmoid(inner_cross[inner_cross < 0] / (highlight - reject)) * 0.9
-                    )
+                    global_match_pcd = o3d.geometry.PointCloud()
+                    global_match_pcd.points = o3d.utility.Vector3dVector((global_point_coord[matched_index.unsqueeze(0)]).cpu().numpy())
+                    global_match_pcd.paint_uniform_color((1., 0., 1.))
+                    global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.2)
+                    pcds.append(global_match_mesh)
 
-                    matched_index = torch.argmax(inner_cross)
+                    local_match_pcd = o3d.geometry.PointCloud()
+                    local_match_pcd.points = o3d.utility.Vector3dVector((local_point_coord[select_index] + bias).cpu().numpy())
+                    local_match_pcd.paint_uniform_color((1., 0., 1.))
+                    local_match_mesh = keypoints_to_spheres(local_match_pcd, radius=0.2)
+                    pcds.append(local_match_mesh)
 
-                    local_heat_color = cmap(inner_self.squeeze(0).cpu().numpy())[:, :3]
-                    global_heat_color = cmap(inner_cross.squeeze(0).cpu().numpy())[:, :3]
+                    if repeat_index == 0:
+                        video = None  # Initialize video for logging
+                        visualizer = None  # Initialize visualizer for logging
 
-                # shift local view from global view
-                bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
+                    video, visualizer = stream_geometry(args.log_dir, ["render_img", "render_video"], pcds, pcds,
+                                                        save_prefix="feat_dist", vis_sample_idx=scene_idx, repeat_idx=repeat_index, num_repeats=len(view_indices), video=video, visualizer=visualizer)
+
+                    if args.save_vis:
+                        o3d.io.write_point_cloud(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_global.ply"), pcds[0])
+                        o3d.io.write_point_cloud(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_local.ply"), pcds[1])
+                        o3d.io.write_line_set(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_line.ply"), pcds[2])
+                        o3d.io.write_triangle_mesh(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_match_global.ply"), pcds[3])
+                        o3d.io.write_triangle_mesh(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_match_local.ply"), pcds[4])
+            elif args.vis_mode == "mutual_nn":
+                local_points = local_point_coord.cpu().numpy()
+                global_points = global_point_coord.cpu().numpy()
+                local_feats = local_point_feat.cpu().numpy()
+                global_feats = global_point_feat.cpu().numpy()
+
+                local_sample_points, local_sample_idx = farthest_point_down_sample(local_points, int(local_points.shape[0] * args.mutual_nn_sample_rate), return_idx=True)
+                global_sample_points, global_sample_idx = farthest_point_down_sample(global_points, int(global_points.shape[0] * args.mutual_nn_sample_rate), return_idx=True)
+                local_sample_feats = local_feats[local_sample_idx]
+                global_sample_feats = global_feats[global_sample_idx]
+                local_sample_feats = torch.from_numpy(local_sample_feats).cuda()
+                global_sample_feats = torch.from_numpy(global_sample_feats).cuda()
+
+                full_dist_mtx = (local_sample_feats[:, None] - global_sample_feats[None, :]).norm(dim=-1).cpu().numpy()  # (N_local, N_global)
+
+                # Mutual NN assignment (https://gist.github.com/mihaidusmanu/20fd0904b2102acc1330bad9b4badab8)
+                match_local_to_global = full_dist_mtx.argmin(-1)  # (N_local)
+                match_global_to_local = full_dist_mtx.argmin(0)  # (N_global)
+
+                range_local = np.arange(local_sample_points.shape[0])
+                valid_matches = match_global_to_local[match_local_to_global] == range_local
+
+                match_local_idx = range_local[valid_matches]
+                match_global_idx = match_local_to_global[valid_matches]
+
+                match_local_points = local_sample_points[match_local_idx]
+                match_global_points = global_sample_points[match_global_idx]
+
+                bias = np.array([[-args.vis_margin, 0., 0.]])  # original bias in our paper
                 pcds = get_point_cloud(
-                    coord=[global_point_coord, local_point_coord + bias],
-                    color=[global_heat_color, local_heat_color],
+                    coord=[global_point_coord, local_point_coord.cpu().numpy() + bias],
+                    color=[global_point_color, local_point_color],
                     verbose=False,
                 )
                 pcds.append(
                     get_line_set(
-                        coord=torch.cat(
+                        coord=np.concatenate(
                             [
-                                local_point_coord[select_index] + bias,
-                                global_point_coord[matched_index.unsqueeze(0)],
+                                match_local_points + bias,
+                                match_global_points,
                             ]
                         ),
-                        line=np.array([[0, 1]]),
+                        line=np.stack(
+                            [
+                                np.arange(match_local_points.shape[0]),
+                                np.arange(match_local_points.shape[0]) + match_local_points.shape[0]
+                            ], axis=1
+                        ),
                         color=np.array([0, 0, 0]) / 255,
                         verbose=False,
                     )
                 )
 
                 global_match_pcd = o3d.geometry.PointCloud()
-                global_match_pcd.points = o3d.utility.Vector3dVector((global_point_coord[matched_index.unsqueeze(0)]).cpu().numpy())
+                global_match_pcd.points = o3d.utility.Vector3dVector(match_global_points)
                 global_match_pcd.paint_uniform_color((1., 0., 1.))
                 global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.2)
                 pcds.append(global_match_mesh)
 
                 local_match_pcd = o3d.geometry.PointCloud()
-                local_match_pcd.points = o3d.utility.Vector3dVector((local_point_coord[select_index] + bias).cpu().numpy())
+                local_match_pcd.points = o3d.utility.Vector3dVector(match_local_points + bias)
                 local_match_pcd.paint_uniform_color((1., 0., 1.))
                 local_match_mesh = keypoints_to_spheres(local_match_pcd, radius=0.2)
                 pcds.append(local_match_mesh)
 
-                if repeat_index == 0:
-                    video = None  # Initialize video for logging
-                    visualizer = None  # Initialize visualizer for logging
+                o3d.visualization.draw_geometries(pcds)
 
-                video, visualizer = stream_geometry(args.log_dir, ["render_img", "render_video"], pcds, pcds,
-                                                    save_prefix="feat_dist", vis_sample_idx=scene_idx, repeat_idx=repeat_index, num_repeats=len(view_indices), video=video, visualizer=visualizer)
-
-                if args.save_vis:
-                    o3d.io.write_point_cloud(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_global.ply"), pcds[0])
-                    o3d.io.write_point_cloud(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_local.ply"), pcds[1])
-                    o3d.io.write_line_set(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_line.ply"), pcds[2])
-                    o3d.io.write_triangle_mesh(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_match_global.ply"), pcds[3])
-                    o3d.io.write_triangle_mesh(os.path.join(args.log_dir, f"similarity_{scene_idx}_{view_index}_match_local.ply"), pcds[4])
+            else:
+                raise NotImplementedError("Other visualization modes not supported")
