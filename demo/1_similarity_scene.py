@@ -35,6 +35,7 @@ from typing import Union, Tuple
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 from tqdm import trange
+from matplotlib import colormaps
 
 
 def check_in_polygon(poly_points: np.ndarray, query_points: np.ndarray):
@@ -246,12 +247,15 @@ if __name__ == "__main__":
     parser.add_argument("--scene_pair_file", type=str, help="Path to .tsv file containing list of scenes with ground-truth matching objects", default=None)
     parser.add_argument("--num_floor_points", help="Number of floor points for extracting sonata features", default=0, type=int)
     parser.add_argument("--feat_sample_points", type=int, help="Number of points to sample per object model for feature extraction", default=2048)
+    parser.add_argument("--normalize_feats", help="If True, normalize network outputs to unit norm", action="store_true")
 
     # Visualization configs
     parser.add_argument("--vis_margin", help="Amount of margins to apply for reference scene during visualization", default=10., type=float)
     parser.add_argument("--vis_every", help="Point cloud sampling rate for visualization", default=500, type=int)
     parser.add_argument("--vis_indices", help="Point indices for visualization", nargs="+", type=int)
     parser.add_argument("--save_vis", help="Save point cloud used for visualization", action="store_true")
+    parser.add_argument("--vis_gamma", help="Gamma value to use for visualization", default=1., type=float)
+    parser.add_argument("--colorize_method", help="Method for visualizing feature distances", default="dist", type=str)
 
     args = parser.parse_args()
 
@@ -401,40 +405,62 @@ if __name__ == "__main__":
 
             for repeat_index, view_index in enumerate(view_indices):
                 select_index = [[view_index]]
-                target = F.normalize(local_point.feat, p=2, dim=-1)
-                refer = F.normalize(global_point.feat, p=2, dim=-1)
-                inner_self = target[select_index] @ target.t()
-                inner_cross = target[select_index] @ refer.t()
 
-                oral = 0.02
-                highlight = 0.1
-                reject = 0.5
-                cmap = plt.get_cmap("Spectral_r")
-                sorted_inner = torch.sort(inner_cross, descending=True)[0]
-                oral = sorted_inner[0, int(global_point.offset[0] * oral)]
-                highlight = sorted_inner[0, int(global_point.offset[0] * highlight)]
-                reject = sorted_inner[0, -int(global_point.offset[0] * reject)]
+                if args.normalize_feats:
+                    target = F.normalize(local_point.feat, p=2, dim=-1)
+                    refer = F.normalize(global_point.feat, p=2, dim=-1)
+                else:
+                    target = local_point.feat.clone().detach()
+                    refer = global_point.feat.clone().detach()
 
-                inner_self = inner_self - highlight
-                inner_self[inner_self > 0] = F.sigmoid(
-                    inner_self[inner_self > 0] / (oral - highlight)
-                )
-                inner_self[inner_self < 0] = (
-                    F.sigmoid(inner_self[inner_self < 0] / (highlight - reject)) * 0.9
-                )
+                if args.colorize_method == "dist":
+                    dist_self = (target[select_index] - target).norm(dim=-1).reshape(-1)  # (N_unif, )
+                    dist_cross = (target[select_index] - refer).norm(dim=-1).reshape(-1)
+                    max_norm_dist_self = (dist_self - dist_self.min()) / (dist_self.max() - dist_self.min() + 1e-5)
+                    max_norm_dist_self = max_norm_dist_self ** args.vis_gamma
+                    max_norm_dist_self = max_norm_dist_self.cpu().numpy()
+                    local_heat_color = colormaps['jet'](max_norm_dist_self, alpha=False, bytes=False)[:, :3]
 
-                inner_cross = inner_cross - highlight
-                inner_cross[inner_cross > 0] = F.sigmoid(
-                    inner_cross[inner_cross > 0] / (oral - highlight)
-                )
-                inner_cross[inner_cross < 0] = (
-                    F.sigmoid(inner_cross[inner_cross < 0] / (highlight - reject)) * 0.9
-                )
+                    max_norm_dist_cross = (dist_cross - dist_cross.min()) / (dist_cross.max() - dist_cross.min() + 1e-5)
+                    max_norm_dist_cross = max_norm_dist_cross ** args.vis_gamma
+                    max_norm_dist_cross = max_norm_dist_cross.cpu().numpy()
+                    global_heat_color = colormaps['jet'](max_norm_dist_cross, alpha=False, bytes=False)[:, :3]
 
-                matched_index = torch.argmax(inner_cross)
+                    matched_index = torch.argmin(dist_cross)
+                else:  # Sigmoid-based visualization as in Sonata
+                    inner_self = target[select_index] @ target.t()
+                    inner_cross = target[select_index] @ refer.t()
 
-                local_heat_color = cmap(inner_self.squeeze(0).cpu().numpy())[:, :3]
-                global_heat_color = cmap(inner_cross.squeeze(0).cpu().numpy())[:, :3]
+                    oral = 0.02
+                    highlight = 0.1
+                    reject = 0.5
+                    cmap = plt.get_cmap("Spectral_r")
+                    sorted_inner = torch.sort(inner_cross, descending=True)[0]
+                    oral = sorted_inner[0, int(global_point.offset[0] * oral)]
+                    highlight = sorted_inner[0, int(global_point.offset[0] * highlight)]
+                    reject = sorted_inner[0, -int(global_point.offset[0] * reject)]
+
+                    inner_self = inner_self - highlight
+                    inner_self[inner_self > 0] = F.sigmoid(
+                        inner_self[inner_self > 0] / (oral - highlight)
+                    )
+                    inner_self[inner_self < 0] = (
+                        F.sigmoid(inner_self[inner_self < 0] / (highlight - reject)) * 0.9
+                    )
+
+                    inner_cross = inner_cross - highlight
+                    inner_cross[inner_cross > 0] = F.sigmoid(
+                        inner_cross[inner_cross > 0] / (oral - highlight)
+                    )
+                    inner_cross[inner_cross < 0] = (
+                        F.sigmoid(inner_cross[inner_cross < 0] / (highlight - reject)) * 0.9
+                    )
+
+                    matched_index = torch.argmax(inner_cross)
+
+                    local_heat_color = cmap(inner_self.squeeze(0).cpu().numpy())[:, :3]
+                    global_heat_color = cmap(inner_cross.squeeze(0).cpu().numpy())[:, :3]
+
                 # shift local view from global view
                 bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
                 pcds = get_point_cloud(
