@@ -38,6 +38,50 @@ from tqdm import trange
 from matplotlib import colormaps
 
 
+def o3d_geometry_list_scale(in_geometry_list: List, scale_amount: float = 1., centroid: np.ndarray = np.zeros([3, 1])):
+    out_geometry_list = []
+    for in_geometry in in_geometry_list:
+        if isinstance(in_geometry, o3d.geometry.TriangleMesh):
+            out_geometry = o3d.geometry.TriangleMesh(in_geometry)
+            out_geometry.scale(scale_amount, centroid)
+        if isinstance(in_geometry, o3d.geometry.PointCloud):
+            out_geometry = o3d.geometry.PointCloud(in_geometry)
+            out_geometry.scale(scale_amount, centroid)
+        if isinstance(in_geometry, o3d.geometry.LineSet):
+            out_geometry = o3d.geometry.LineSet(in_geometry)
+            out_geometry.scale(scale_amount, centroid)
+        if isinstance(in_geometry, o3d.geometry.AxisAlignedBoundingBox):
+            out_geometry = o3d.geometry.AxisAlignedBoundingBox(in_geometry)
+            out_geometry.scale(scale_amount, centroid)
+        if isinstance(in_geometry, o3d.geometry.OrientedBoundingBox):
+            out_geometry = o3d.geometry.OrientedBoundingBox(in_geometry)
+            out_geometry.scale(scale_amount, centroid)
+        out_geometry_list.append(out_geometry)
+    return out_geometry_list
+
+
+def o3d_geometry_list_shift(in_geometry_list: List, shift_amount: List = [0., 0., 0.]):
+    out_geometry_list = []
+    for in_geometry in in_geometry_list:
+        if isinstance(in_geometry, o3d.geometry.TriangleMesh):
+            out_geometry = o3d.geometry.TriangleMesh(in_geometry)
+            out_geometry.translate(np.array([shift_amount], dtype=np.float64).T)
+        if isinstance(in_geometry, o3d.geometry.PointCloud):
+            out_geometry = o3d.geometry.PointCloud(in_geometry)
+            out_geometry.translate(np.array([shift_amount], dtype=np.float64).T)
+        if isinstance(in_geometry, o3d.geometry.LineSet):
+            out_geometry = o3d.geometry.LineSet(in_geometry)
+            out_geometry.translate(np.array([shift_amount], dtype=np.float64).T)
+        if isinstance(in_geometry, o3d.geometry.AxisAlignedBoundingBox):
+            out_geometry = o3d.geometry.AxisAlignedBoundingBox(in_geometry)
+            out_geometry.translate(np.array([shift_amount], dtype=np.float64).T)
+        if isinstance(in_geometry, o3d.geometry.OrientedBoundingBox):
+            out_geometry = o3d.geometry.OrientedBoundingBox(in_geometry)
+            out_geometry.translate(np.array([shift_amount], dtype=np.float64).T)
+        out_geometry_list.append(out_geometry)
+    return out_geometry_list
+
+
 def get_color_wheel() -> torch.Tensor:
     RY = 15
     YG = 6
@@ -730,6 +774,143 @@ if __name__ == "__main__":
                 pcds.append(local_match_mesh)
 
                 o3d.visualization.draw_geometries(pcds)
+            elif args.vis_mode == "scene":
+                rot_pcds = []
+                for rot_idx in range(full_global_point_feat.shape[0]):
+                    if rot_idx == 0:
+                        bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
+                        pcds = get_point_cloud(
+                            coord=[rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1), local_point_coord + bias * rot_matrices.shape[0]],
+                            color=[global_point_color, local_point_color],
+                            verbose=False,
+                        )
+                        rot_pcds.extend(pcds)
+                    else:
+                        bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
+                        pcds = get_point_cloud(
+                            coord=[rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1)],
+                            color=[global_point_color],
+                            verbose=False,
+                        )
+                        rot_pcds.extend(pcds)
+                o3d.visualization.draw_geometries(rot_pcds)
+            elif args.vis_mode == "feat_dist_rot":  # Show feature distances of rotated point clouds
+                # Get point orderings
+                local_points = local_point_coord.cpu().numpy()
+                sort_dt = np.dtype([('x', local_points.dtype), ('y', local_points.dtype), ('z', local_points.dtype)])
+                local_points_for_sort = np.zeros(local_points.shape[0], dtype=sort_dt)
+                local_points_for_sort['x'] = local_points[:, 0]
+                local_points_for_sort['y'] = local_points[:, 1]
+                local_points_for_sort['z'] = local_points[:, 2]
+                view_indices = np.argsort(local_points_for_sort, order=['x', 'z', 'y'])
 
+                if args.vis_indices is not None:
+                    view_indices = view_indices[args.vis_indices]
+                else:
+                    view_indices = view_indices[::args.vis_every]
+
+                for repeat_index, view_index in enumerate(view_indices):
+                    select_index = [[view_index]]
+                    rot_pcds = []
+                    for rot_idx in range(full_global_point_feat.shape[0]):
+                        if args.normalize_feats:
+                            target = F.normalize(local_point_feat, p=2, dim=-1)
+                            refer = F.normalize(full_global_point_feat[rot_idx], p=2, dim=-1)
+                        else:
+                            target = local_point_feat.clone().detach()
+                            refer = full_global_point_feat[rot_idx].clone().detach()
+
+                        if args.colorize_method == "dist":
+                            dist_self = (target[select_index] - target).norm(dim=-1).reshape(-1)  # (N_unif, )
+                            dist_cross = (target[select_index] - refer).norm(dim=-1).reshape(-1)
+                            max_norm_dist_self = (dist_self - dist_self.min()) / (dist_self.max() - dist_self.min() + 1e-5)
+                            max_norm_dist_self = max_norm_dist_self ** args.vis_gamma
+                            max_norm_dist_self = max_norm_dist_self.cpu().numpy()
+                            local_heat_color = colormaps['jet'](max_norm_dist_self, alpha=False, bytes=False)[:, :3]
+
+                            max_norm_dist_cross = (dist_cross - dist_cross.min()) / (dist_cross.max() - dist_cross.min() + 1e-5)
+                            max_norm_dist_cross = max_norm_dist_cross ** args.vis_gamma
+                            max_norm_dist_cross = max_norm_dist_cross.cpu().numpy()
+                            global_heat_color = colormaps['jet'](max_norm_dist_cross, alpha=False, bytes=False)[:, :3]
+
+                            matched_index = torch.argmin(dist_cross)
+                        else:  # Sigmoid-based visualization as in Sonata
+                            inner_self = target[select_index] @ target.t()
+                            inner_cross = target[select_index] @ refer.t()
+
+                            oral = 0.02
+                            highlight = 0.1
+                            reject = 0.5
+                            cmap = plt.get_cmap("Spectral_r")
+                            sorted_inner = torch.sort(inner_cross, descending=True)[0]
+                            oral = sorted_inner[0, int(global_point_offset * oral)]
+                            highlight = sorted_inner[0, int(global_point_offset * highlight)]
+                            reject = sorted_inner[0, -int(global_point_offset * reject)]
+
+                            inner_self = inner_self - highlight
+                            inner_self[inner_self > 0] = F.sigmoid(
+                                inner_self[inner_self > 0] / (oral - highlight)
+                            )
+                            inner_self[inner_self < 0] = (
+                                F.sigmoid(inner_self[inner_self < 0] / (highlight - reject)) * 0.9
+                            )
+
+                            inner_cross = inner_cross - highlight
+                            inner_cross[inner_cross > 0] = F.sigmoid(
+                                inner_cross[inner_cross > 0] / (oral - highlight)
+                            )
+                            inner_cross[inner_cross < 0] = (
+                                F.sigmoid(inner_cross[inner_cross < 0] / (highlight - reject)) * 0.9
+                            )
+
+                            matched_index = torch.argmax(inner_cross)
+
+                            local_heat_color = cmap(inner_self.squeeze(0).cpu().numpy())[:, :3]
+                            global_heat_color = cmap(inner_cross.squeeze(0).cpu().numpy())[:, :3]
+
+                        # shift local view from global view
+
+                        if rot_idx == 0:
+                            bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
+                            pcds = get_point_cloud(
+                                coord=[rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1), local_point_coord + bias * rot_matrices.shape[0]],
+                                color=[global_heat_color, local_heat_color],
+                                verbose=False,
+                            )
+                            global_match_pcd = o3d.geometry.PointCloud()
+                            global_match_pcd.points = o3d.utility.Vector3dVector((rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse][matched_index.unsqueeze(0)] + bias * (rot_matrices.shape[0] - rot_idx - 1)).cpu().numpy())
+                            global_match_pcd.paint_uniform_color((1., 0., 1.))
+                            global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.5)
+                            pcds.append(global_match_mesh)
+
+                            local_match_pcd = o3d.geometry.PointCloud()
+                            local_match_pcd.points = o3d.utility.Vector3dVector((local_point_coord[select_index] + bias * rot_matrices.shape[0]).cpu().numpy())
+                            local_match_pcd.paint_uniform_color((1., 0., 1.))
+                            local_match_mesh = keypoints_to_spheres(local_match_pcd, radius=0.5)
+                            pcds.append(local_match_mesh)
+                            rot_pcds.extend(pcds)
+                        else:
+                            bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
+                            pcds = get_point_cloud(
+                                coord=[rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1)],
+                                color=[global_heat_color],
+                                verbose=False,
+                            )
+                            global_match_pcd = o3d.geometry.PointCloud()
+                            global_match_pcd.points = o3d.utility.Vector3dVector((rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse][matched_index.unsqueeze(0)] + bias * (rot_matrices.shape[0] - rot_idx - 1)).cpu().numpy())
+                            global_match_pcd.paint_uniform_color((1., 0., 1.))
+                            global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.5)
+                            pcds.append(global_match_mesh)
+                            rot_pcds.extend(pcds)
+
+                    if repeat_index == 0:
+                        video = None  # Initialize video for logging
+                        visualizer = None  # Initialize visualizer for logging
+
+                    # Shift and scale for fitting
+                    rot_pcds = o3d_geometry_list_scale(rot_pcds, 0.5)
+                    rot_pcds = o3d_geometry_list_shift(rot_pcds, (10.0, 0., 0.))
+                    video, visualizer = stream_geometry(args.log_dir, ["render_img", "render_video"], rot_pcds, rot_pcds,
+                                                        save_prefix="feat_dist_rot", vis_sample_idx=scene_idx, repeat_idx=repeat_index, num_repeats=len(view_indices), video=video, visualizer=visualizer)
             else:
                 raise NotImplementedError("Other visualization modes not supported")
