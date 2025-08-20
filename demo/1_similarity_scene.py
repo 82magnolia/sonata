@@ -38,6 +38,61 @@ from tqdm import trange
 from matplotlib import colormaps
 
 
+def get_color_wheel() -> torch.Tensor:
+    RY = 15
+    YG = 6
+    GC = 4
+    CB = 11
+    BM = 13
+    MR = 6
+    color_wheel = torch.zeros((RY + YG + GC + CB + BM + MR, 3), dtype=torch.float32)
+    counter = 0
+    color_wheel[0:RY, 0] = 255
+    color_wheel[0:RY, 1] = torch.floor(255 * torch.arange(0, RY) / RY)
+    counter += RY
+    color_wheel[counter:counter + YG, 0] = 255 - torch.floor(255 * torch.arange(0, YG) / YG)
+    color_wheel[counter:counter + YG, 1] = 255
+    counter += YG
+    color_wheel[counter:counter + GC, 1] = 255
+    color_wheel[counter:counter + GC, 2] = torch.floor(255 * torch.arange(0, GC) / GC)
+    counter += GC
+    color_wheel[counter:counter + CB, 1] = 255 - torch.floor(255 * torch.arange(0, CB) / CB)
+    color_wheel[counter:counter + CB, 2] = 255
+    counter += CB
+    color_wheel[counter:counter + BM, 2] = 255
+    color_wheel[counter:counter + BM, 0] = torch.floor(255 * torch.arange(0, BM) / BM)
+    counter += BM
+    color_wheel[counter:counter + MR, 2] = 255 - torch.floor(255 * torch.arange(0, MR) / MR)
+    color_wheel[counter:counter + MR, 0] = 255
+    return color_wheel / 255
+
+
+def map_coordinates_to_color(point_cloud, color_wheel):
+
+    xyz_max = point_cloud.max(axis=0)
+    xyz_min = point_cloud.min(axis=0)
+    xyz_center = (xyz_max + xyz_min) / 2
+
+    x = point_cloud[:, 0] - xyz_min[0]
+    y = point_cloud[:, 1] - xyz_min[1]
+    z = point_cloud[:, 2] - xyz_min[2]
+
+    # Calculate distances to x+z=0
+    dist = np.abs(x + z) / np.sqrt(2)
+    # Normalization
+    dist = (dist - dist.min()) / (dist.max() - dist.min()) * 0.9 * (color_wheel.shape[0] - 1)
+
+    # Assign colors in the color wheel
+    k0 = np.floor(dist).astype(int)
+    k1 = (k0 + 1) % color_wheel.shape[0]
+    f = dist - k0
+
+    # Interpolate between colors in the color wheel
+    colors = (1 - f[:, None]) * color_wheel[k0] + f[:, None] * color_wheel[k1]
+
+    return colors
+
+
 def choice_without_replacement(l: Union[List, np.array], n, return_idx=False):
     if isinstance(l, list):
         idx_list = np.random.permutation(len(l))[:n].tolist()
@@ -658,34 +713,19 @@ if __name__ == "__main__":
                     color=[global_point_color, local_point_color],
                     verbose=False,
                 )
-                pcds.append(
-                    get_line_set(
-                        coord=np.concatenate(
-                            [
-                                match_local_points + bias,
-                                match_global_points,
-                            ]
-                        ),
-                        line=np.stack(
-                            [
-                                np.arange(match_local_points.shape[0]),
-                                np.arange(match_local_points.shape[0]) + match_local_points.shape[0]
-                            ], axis=1
-                        ),
-                        color=np.array([0, 0, 0]) / 255,
-                        verbose=False,
-                    )
-                )
+
+                color_wheel = get_color_wheel().numpy()
+                idx_color = map_coordinates_to_color(np.array(match_local_points), color_wheel)
 
                 global_match_pcd = o3d.geometry.PointCloud()
                 global_match_pcd.points = o3d.utility.Vector3dVector(match_global_points)
-                global_match_pcd.paint_uniform_color((1., 0., 1.))
+                global_match_pcd.colors = o3d.utility.Vector3dVector(idx_color)
                 global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.2)
                 pcds.append(global_match_mesh)
 
                 local_match_pcd = o3d.geometry.PointCloud()
                 local_match_pcd.points = o3d.utility.Vector3dVector(match_local_points + bias)
-                local_match_pcd.paint_uniform_color((1., 0., 1.))
+                local_match_pcd.colors = o3d.utility.Vector3dVector(idx_color)
                 local_match_mesh = keypoints_to_spheres(local_match_pcd, radius=0.2)
                 pcds.append(local_match_mesh)
 
