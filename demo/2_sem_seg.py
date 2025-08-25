@@ -18,6 +18,8 @@ import open3d as o3d
 import sonata
 import torch
 import torch.nn as nn
+import argparse
+import os
 
 try:
     import flash_attn
@@ -128,8 +130,17 @@ class SegHead(nn.Module):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log_dir", help="Log directory for saving experiment results", default="./log/")
+    parser.add_argument("--seed", help="Seed value to use for reproducing experiments", default=0, type=int)
+    parser.add_argument("--pcd_path", help="Path to point cloud .ply or .txt file", type=str)
+    args = parser.parse_args()
+
+    if not os.path.exists(args.log_dir):
+        os.makedirs(args.log_dir, exist_ok=True)
+
     # set random seed
-    sonata.utils.set_seed(24525867)
+    sonata.utils.set_seed(args.seed)
     # Load model
     if flash_attn is not None:
         model = sonata.load("sonata", repo_id="facebook/sonata").cuda()
@@ -149,11 +160,33 @@ if __name__ == "__main__":
     seg_head.load_state_dict(ckpt["state_dict"])
     # Load default data transform pipeline
     transform = sonata.transform.default()
+
     # Load data
-    point = sonata.data.load("sample1")
-    point.pop("segment200")
-    segment = point.pop("segment20")
-    point["segment"] = segment  # two kinds of segment exist in ScanNet, only use one
+    if args.pcd_path.endswith("txt"):
+        curr_points = np.loadtxt(args.pcd_path)
+        curr_points = curr_points[:, :3]
+        if curr_points.shape[-1] > 3:
+            curr_colors = curr_points[:, 3:6]
+        else:
+            curr_colors = np.zeros_like(curr_points)
+    else:
+        curr_pcd = o3d.io.read_point_cloud(args.pcd_path)
+        curr_points = np.asarray(curr_pcd.points)
+        if curr_pcd.colors is not None:
+            curr_colors = np.asarray(curr_pcd.colors)
+        else:
+            curr_colors = np.zeros_like(curr_points)
+
+    o3d_pcd = o3d.geometry.PointCloud()
+    o3d_pcd.points = o3d.utility.Vector3dVector(curr_points)
+    o3d_pcd.estimate_normals()
+
+    point = {
+        "coord": curr_points,
+        "color": curr_colors,
+        "normal": np.asarray(o3d_pcd.normals)
+    }
+
     original_coord = point["coord"].copy()
     point = transform(point)
 
@@ -182,4 +215,28 @@ if __name__ == "__main__":
     pcd.points = o3d.utility.Vector3dVector(point.coord.cpu().detach().numpy())
     pcd.colors = o3d.utility.Vector3dVector(color / 255)
     o3d.visualization.draw_geometries([pcd])
-    # o3d.io.write_point_cloud("sem_seg.ply", pcd)
+    o3d.io.write_point_cloud(os.path.join(args.log_dir, "sem_seg.ply"), pcd)
+
+    """
+    # Compare with original pcd from sonata
+    point = sonata.data.load("sample1")
+    point.pop("segment200")
+    segment = point.pop("segment20")
+    point["segment"] = segment  # two kinds of segment exist in ScanNet, only use one
+    sonata_pcd = o3d.geometry.PointCloud()
+    sonata_pcd.points = o3d.utility.Vector3dVector(point["coord"])
+    sonata_pcd.colors = o3d.utility.Vector3dVector(point["color"] / 255.)
+    o3d.io.write_point_cloud(os.path.join(args.log_dir, "sonata_pcd.ply"), sonata_pcd)
+
+    # Visualize point segment
+    seg_color = np.zeros_like(point["color"] / 255.)
+    unq_seg = np.unique(segment)
+    for seg_lab in unq_seg:
+        rand_color = np.random.rand(1, 3)
+        seg_color[segment == seg_lab] = rand_color
+    seg_pcd = o3d.geometry.PointCloud()
+    seg_pcd.points = o3d.utility.Vector3dVector(point["coord"])
+    seg_pcd.colors = o3d.utility.Vector3dVector(seg_color)
+    o3d.io.write_point_cloud(os.path.join(args.log_dir, "sonata_seg_pcd.ply"), seg_pcd)
+    o3d.visualization.draw_geometries([seg_pcd])
+    """
