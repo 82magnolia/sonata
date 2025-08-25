@@ -44,6 +44,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", help="Log directory for saving experiment results", default="./log/")
     parser.add_argument("--seed", help="Seed value to use for reproducing experiments", default=0, type=int)
     parser.add_argument("--pcd_path", help="Path to point cloud .ply or .txt file", type=str)
+    parser.add_argument("--y_to_z_up", help="Optionally rotate point cloud whose y-axis is up to z-axis is up", action="store_true")
 
     args = parser.parse_args()
 
@@ -82,6 +83,14 @@ if __name__ == "__main__":
             curr_colors = np.asarray(curr_pcd.colors)
         else:
             curr_colors = np.zeros_like(curr_points)
+
+    if args.y_to_z_up:
+        rot_mtx = np.array([
+            [-1., 0., 0.],
+            [0., 0., 1.],
+            [0., 1., 0.]
+        ])
+        curr_points = curr_points @ rot_mtx.T
 
     o3d_pcd = o3d.geometry.PointCloud()
     o3d_pcd.points = o3d.utility.Vector3dVector(curr_points)
@@ -124,6 +133,10 @@ if __name__ == "__main__":
 
         # PCA
         pca_color = get_pca_color(point.feat, brightness=1.2, center=True)
+
+    # Revert back to original coordinate frame
+    if args.y_to_z_up:
+        original_coord = original_coord @ rot_mtx
 
     # inverse back to original scale before grid sampling
     # point.inverse is acquired from the GirdSampling transform
