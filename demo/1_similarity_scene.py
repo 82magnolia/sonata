@@ -184,7 +184,7 @@ def generate_yaw_points(num_rot: int, device='cpu'):
     return yaw_arr
 
 
-def yaw2rot_mtx(yaw_arr: torch.Tensor, apply_xz_flip=False):
+def yaw2rot_mtx(yaw_arr: torch.Tensor, apply_flip=False, up_axis='y'):
     # Initialize rotation matrices from yaw values
     def _yaw2mtx(yaw):
         # yaw is assumed to be a scalar
@@ -193,18 +193,28 @@ def yaw2rot_mtx(yaw_arr: torch.Tensor, apply_xz_flip=False):
         tensor_0 = torch.zeros(1, device=yaw.device)
         tensor_1 = torch.ones(1, device=yaw.device)
 
-        R = torch.stack([
-            torch.stack([torch.cos(yaw), tensor_0, -torch.sin(yaw)]),
-            torch.stack([tensor_0, tensor_1, tensor_0]),
-            torch.stack([torch.sin(yaw), tensor_0, torch.cos(yaw)])
-        ]).reshape(3, 3)
+        if up_axis == 'z':
+            R = torch.stack([
+                torch.stack([torch.cos(yaw), -torch.sin(yaw), tensor_0]),
+                torch.stack([torch.sin(yaw), torch.cos(yaw), tensor_0]),
+                torch.stack([tensor_0, tensor_0, tensor_1])
+            ]).reshape(3, 3)
+        elif up_axis == 'y':
+            R = torch.stack([
+                torch.stack([torch.cos(yaw), tensor_0, -torch.sin(yaw)]),
+                torch.stack([tensor_0, tensor_1, tensor_0]),
+                torch.stack([torch.sin(yaw), tensor_0, torch.cos(yaw)])
+            ]).reshape(3, 3)
+        else:
+            raise NotImplementedError("Other up axes not supported")
 
         return R
 
     tot_mtx = []
     for yaw in yaw_arr:
-        if apply_xz_flip:
+        if apply_flip:
             tot_mtx.append(_yaw2mtx(yaw))
+            # NOTE: Here we assume y or z axis is given as the up direction
             tot_mtx.append(_yaw2mtx(yaw) @ np.array([[-1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]))  # X flip (Z flip is subsumed by X flip + rotation)
         else:
             tot_mtx.append(_yaw2mtx(yaw))
@@ -433,6 +443,7 @@ if __name__ == "__main__":
     parser.add_argument("--vis_gamma", help="Gamma value to use for visualization", default=1., type=float)
     parser.add_argument("--colorize_method", help="Method for visualizing feature distances", default="dist", type=str)
     parser.add_argument("--vis_mode", help="Visualization mode of features", default="feat_dist")
+    parser.add_argument("--y_to_z_up", help="Optionally rotate point cloud whose y-axis is up to z-axis is up", action="store_true")
 
     args = parser.parse_args()
 
@@ -505,6 +516,14 @@ if __name__ == "__main__":
             curr_points = np.concatenate(curr_points_list, axis=0)
             curr_colors = np.concatenate(curr_colors_list, axis=0) / 255.
 
+            if args.y_to_z_up:
+                y_to_z_up_rot_mtx = np.array([
+                    [-1., 0., 0.],
+                    [0., 0., 1.],
+                    [0., 1., 0.]
+                ])
+                curr_points = curr_points @ y_to_z_up_rot_mtx.T
+
             o3d_pcd = o3d.geometry.PointCloud()
             o3d_pcd.points = o3d.utility.Vector3dVector(curr_points)
             o3d_pcd.estimate_normals()
@@ -524,7 +543,10 @@ if __name__ == "__main__":
 
         # Obtain list of rotation matrices
         yaw_points = generate_yaw_points(args.rot_aug)
-        rot_matrices = yaw2rot_mtx(yaw_points, apply_xz_flip=args.flip_aug).float().cpu().numpy()
+        if args.y_to_z_up:
+            rot_matrices = yaw2rot_mtx(yaw_points, apply_flip=args.flip_aug, up_axis='z').float().cpu().numpy()
+        else:
+            rot_matrices = yaw2rot_mtx(yaw_points, apply_flip=args.flip_aug).float().cpu().numpy()
 
         rot_local_data_list = [
             {
@@ -585,6 +607,16 @@ if __name__ == "__main__":
                     inverse = rot_local_point.pop("pooling_inverse")
                     parent.feat = rot_local_point.feat[inverse]
                     rot_local_point = parent
+
+                if args.y_to_z_up:  # Rotate back to original coordinate frame 
+                    y_to_z_up_rot_mtx = torch.tensor([
+                        [-1., 0., 0.],
+                        [0., 0., 1.],
+                        [0., 1., 0.]
+                    ], device="cuda", dtype=torch.float)
+                    rot_local_point.coord = rot_local_point.coord @ y_to_z_up_rot_mtx
+                    rot_global_point.coord = rot_global_point.coord @ y_to_z_up_rot_mtx
+
                 rot_local_point_list.append(rot_local_point)
                 rot_global_point_list.append(rot_global_point)
 
@@ -868,17 +900,16 @@ if __name__ == "__main__":
                             local_heat_color = cmap(inner_self.squeeze(0).cpu().numpy())[:, :3]
                             global_heat_color = cmap(inner_cross.squeeze(0).cpu().numpy())[:, :3]
 
-                        # shift local view from global view
-
+                        # shift local view from global view (NOTE: we fix rotated scenes for easier visualization)
                         if rot_idx == 0:
                             bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
                             pcds = get_point_cloud(
-                                coord=[rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1), local_point_coord + bias * rot_matrices.shape[0]],
+                                coord=[rot_global_point_list[0].coord[rot_global_point_list[0].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1), local_point_coord + bias * rot_matrices.shape[0]],
                                 color=[global_heat_color, local_heat_color],
                                 verbose=False,
                             )
                             global_match_pcd = o3d.geometry.PointCloud()
-                            global_match_pcd.points = o3d.utility.Vector3dVector((rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse][matched_index.unsqueeze(0)] + bias * (rot_matrices.shape[0] - rot_idx - 1)).cpu().numpy())
+                            global_match_pcd.points = o3d.utility.Vector3dVector((rot_global_point_list[0].coord[rot_global_point_list[0].inverse][matched_index.unsqueeze(0)] + bias * (rot_matrices.shape[0] - rot_idx - 1)).cpu().numpy())
                             global_match_pcd.paint_uniform_color((1., 0., 1.))
                             global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.5)
                             pcds.append(global_match_mesh)
@@ -892,12 +923,12 @@ if __name__ == "__main__":
                         else:
                             bias = torch.tensor([[-args.vis_margin, 0., 0.]]).cuda()  # original bias in our paper
                             pcds = get_point_cloud(
-                                coord=[rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1)],
+                                coord=[rot_global_point_list[0].coord[rot_global_point_list[0].inverse] + bias * (rot_matrices.shape[0] - rot_idx - 1)],
                                 color=[global_heat_color],
                                 verbose=False,
                             )
                             global_match_pcd = o3d.geometry.PointCloud()
-                            global_match_pcd.points = o3d.utility.Vector3dVector((rot_global_point_list[rot_idx].coord[rot_global_point_list[rot_idx].inverse][matched_index.unsqueeze(0)] + bias * (rot_matrices.shape[0] - rot_idx - 1)).cpu().numpy())
+                            global_match_pcd.points = o3d.utility.Vector3dVector((rot_global_point_list[0].coord[rot_global_point_list[0].inverse][matched_index.unsqueeze(0)] + bias * (rot_matrices.shape[0] - rot_idx - 1)).cpu().numpy())
                             global_match_pcd.paint_uniform_color((1., 0., 1.))
                             global_match_mesh = keypoints_to_spheres(global_match_pcd, radius=0.5)
                             pcds.append(global_match_mesh)
