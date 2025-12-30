@@ -434,6 +434,8 @@ if __name__ == "__main__":
     parser.add_argument("--rot_aug", help="Number of uniformly sampled y-axis (height-axis) rotations for feature averaging", default=1, type=int)
     parser.add_argument("--flip_aug", help="If True, apply flip augmentations and average them for feature extraction", action="store_true")
     parser.add_argument("--mutual_nn_sample_rate", help="Downsampling rate for mutual NN computation", default=0.01, type=float)
+    parser.add_argument("--grid_size", help="Size of grid for voxelizing point cloud before extracting sonata and concerto features", default=0.02, type=float)
+    parser.add_argument("--comp_layer_idx", help="Layer features to compare", default=-1, type=int)
 
     # Visualization configs
     parser.add_argument("--vis_margin", help="Amount of margins to apply for reference scene during visualization", default=10., type=float)
@@ -464,7 +466,7 @@ if __name__ == "__main__":
             "sonata", repo_id="facebook/sonata", custom_config=custom_config
         ).cuda()
     # Load default data transform pipeline
-    transform = sonata.transform.default()
+    transform = sonata.transform.default_grid_control(args.grid_size)
 
     # Iterate over scene point clouds
     scene_pair_table = pd.read_table(args.scene_pair_file)
@@ -566,6 +568,9 @@ if __name__ == "__main__":
         # model forward:
         rot_local_point_list = []
         rot_global_point_list = []
+        rot_local_feat_list = []
+        rot_global_feat_list = []
+
         with torch.inference_mode():
             for rot_local_data, rot_global_data in zip(rot_local_data_list, rot_global_data_list):
                 rot_global_data = transform(rot_global_data)
@@ -577,8 +582,16 @@ if __name__ == "__main__":
                 for key in rot_local_data.keys():
                     if isinstance(rot_local_data[key], torch.Tensor):
                         rot_local_data[key] = rot_local_data[key].cuda(non_blocking=True)
+                global_layer_idx = 0
+                local_layer_idx = 0
                 rot_global_point = model(rot_global_data)
                 rot_local_point = model(rot_local_data)
+                # Track feature to compare starting from target layer
+                if global_layer_idx == args.comp_layer_idx and local_layer_idx == args.comp_layer_idx:
+                    global_comp_feat = rot_global_point.feat.clone().detach()
+                    local_comp_feat = rot_local_point.feat.clone().detach()
+                global_layer_idx += 1
+                local_layer_idx += 1
                 # upcast point feature
                 # Point is a structure contains all the information during forward
                 for _ in range(2):
@@ -588,12 +601,24 @@ if __name__ == "__main__":
                     inverse = rot_global_point.pop("pooling_inverse")
                     parent.feat = torch.cat([parent.feat, rot_global_point.feat[inverse]], dim=-1)
                     rot_global_point = parent
+                    if global_layer_idx == args.comp_layer_idx:
+                        global_comp_feat = rot_global_point.feat.clone().detach()
+                    elif global_layer_idx > args.comp_layer_idx:  # Track inverse map
+                        global_comp_feat = global_comp_feat[inverse]
+                    global_layer_idx += 1
+
                 while "pooling_parent" in rot_global_point.keys():
                     assert "pooling_inverse" in rot_global_point.keys()
                     parent = rot_global_point.pop("pooling_parent")
                     inverse = rot_global_point.pop("pooling_inverse")
                     parent.feat = rot_global_point.feat[inverse]
                     rot_global_point = parent
+                    if global_layer_idx == args.comp_layer_idx:
+                        global_comp_feat = rot_global_point.feat.clone().detach()
+                    elif global_layer_idx > args.comp_layer_idx:  # Track inverse map
+                        global_comp_feat = global_comp_feat[inverse]
+                    global_layer_idx += 1
+
                 for _ in range(2):
                     assert "pooling_parent" in rot_local_point.keys()
                     assert "pooling_inverse" in rot_local_point.keys()
@@ -601,12 +626,23 @@ if __name__ == "__main__":
                     inverse = rot_local_point.pop("pooling_inverse")
                     parent.feat = torch.cat([parent.feat, rot_local_point.feat[inverse]], dim=-1)
                     rot_local_point = parent
+                    if local_layer_idx == args.comp_layer_idx:
+                        local_comp_feat = rot_local_point.feat.clone().detach()
+                    elif local_layer_idx > args.comp_layer_idx:  # Track inverse map
+                        local_comp_feat = local_comp_feat[inverse]
+                    local_layer_idx += 1
+
                 while "pooling_parent" in rot_local_point.keys():
                     assert "pooling_inverse" in rot_local_point.keys()
                     parent = rot_local_point.pop("pooling_parent")
                     inverse = rot_local_point.pop("pooling_inverse")
                     parent.feat = rot_local_point.feat[inverse]
                     rot_local_point = parent
+                    if local_layer_idx == args.comp_layer_idx:
+                        local_comp_feat = rot_local_point.feat.clone().detach()
+                    elif local_layer_idx > args.comp_layer_idx:  # Track inverse map
+                        local_comp_feat = local_comp_feat[inverse]
+                    local_layer_idx += 1
 
                 if args.y_to_z_up:  # Rotate back to original coordinate frame 
                     y_to_z_up_rot_mtx = torch.tensor([
@@ -617,8 +653,14 @@ if __name__ == "__main__":
                     rot_local_point.coord = rot_local_point.coord @ y_to_z_up_rot_mtx
                     rot_global_point.coord = rot_global_point.coord @ y_to_z_up_rot_mtx
 
+                if args.comp_layer_idx == -1:  # Use last layer features
+                    global_comp_feat = rot_global_point.feat.clone().detach()
+                    local_comp_feat = rot_local_point.feat.clone().detach()
+
                 rot_local_point_list.append(rot_local_point)
                 rot_global_point_list.append(rot_global_point)
+                rot_local_feat_list.append(local_comp_feat)
+                rot_global_feat_list.append(global_comp_feat)
 
             # Aggregate augmented results
             local_point_coord = rot_local_point_list[0].coord[rot_local_point_list[0].inverse]
@@ -628,8 +670,8 @@ if __name__ == "__main__":
             local_point_offset = local_point_coord.shape[0]
             global_point_offset = global_point_coord.shape[0]
 
-            full_local_point_feat = torch.stack([rot_local_point.feat[rot_local_point.inverse] for rot_local_point in rot_local_point_list], dim=0)
-            full_global_point_feat = torch.stack([rot_global_point.feat[rot_global_point.inverse] for rot_global_point in rot_global_point_list], dim=0)
+            full_local_point_feat = torch.stack([rot_local_feat[rot_local_point.inverse] for rot_local_point, rot_local_feat in zip(rot_local_point_list, rot_local_feat_list)], dim=0)
+            full_global_point_feat = torch.stack([rot_global_feat[rot_global_point.inverse] for rot_global_point, rot_global_feat in zip(rot_global_point_list, rot_global_feat_list)], dim=0)
 
             local_point_feat = full_local_point_feat.mean(0)
             global_point_feat = full_global_point_feat.mean(0)
