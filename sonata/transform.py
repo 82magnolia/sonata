@@ -1222,3 +1222,25 @@ def default():
         ),
     ]
     return Compose(config)
+
+
+def default_grid_control(grid_size):
+    config = [
+        dict(type="CenterShift", apply_z=True),
+        dict(
+            type="GridSample",
+            grid_size=grid_size,
+            hash_type="fnv",
+            mode="train",
+            return_grid_coord=True,
+            return_inverse=True,
+        ),
+        dict(type="NormalizeColor"),
+        dict(type="ToTensor"),
+        dict(
+            type="Collect",
+            keys=("coord", "grid_coord", "color", "inverse"),
+            feat_keys=("coord", "color", "normal"),
+        ),
+    ]
+    return Compose(config)

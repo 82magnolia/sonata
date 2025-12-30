@@ -45,7 +45,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", help="Seed value to use for reproducing experiments", default=0, type=int)
     parser.add_argument("--pcd_path", help="Path to point cloud .ply or .txt file", type=str)
     parser.add_argument("--y_to_z_up", help="Optionally rotate point cloud whose y-axis is up to z-axis is up", action="store_true")
-
+    parser.add_argument("--grid_size", help="Size of grid for voxelizing point cloud before extracting sonata and concerto features", default=0.02, type=float)
+    parser.add_argument("--vis_layer_idx", help="Layer to visualize", default=-1, type=int)
     args = parser.parse_args()
 
     if not os.path.exists(args.log_dir):
@@ -67,7 +68,7 @@ if __name__ == "__main__":
             "sonata", repo_id="facebook/sonata", custom_config=custom_config
         ).cuda()
     # Load default data transform pipeline
-    transform = sonata.transform.default()
+    transform = sonata.transform.default_grid_control(args.grid_size)
     # Load data
     if args.pcd_path.endswith("txt"):
         curr_points = np.loadtxt(args.pcd_path)
@@ -105,12 +106,18 @@ if __name__ == "__main__":
     original_coord = point["coord"].copy()
     point = transform(point)
 
+    layer_idx = 0
     with torch.inference_mode():
         for key in point.keys():
             if isinstance(point[key], torch.Tensor):
                 point[key] = point[key].cuda(non_blocking=True)
         # model forward:
         point = model(point)
+
+        # Track feature to visualize starting from target layer
+        if layer_idx == args.vis_layer_idx:
+            vis_feat = point.feat.clone().detach()
+        layer_idx += 1
         # upcast point feature
         # Point is a structure contains all the information during forward
         for _ in range(2):
@@ -120,19 +127,33 @@ if __name__ == "__main__":
             inverse = point.pop("pooling_inverse")
             parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
             point = parent
+            if layer_idx == args.vis_layer_idx:
+                vis_feat = point.feat.clone().detach()
+            elif layer_idx > args.vis_layer_idx:  # Track inverse map
+                vis_feat = vis_feat[inverse]
+            layer_idx += 1
+
         while "pooling_parent" in point.keys():
             assert "pooling_inverse" in point.keys()
             parent = point.pop("pooling_parent")
             inverse = point.pop("pooling_inverse")
             parent.feat = point.feat[inverse]
             point = parent
+            if layer_idx == args.vis_layer_idx:
+                vis_feat = point.feat.clone().detach()
+            elif layer_idx > args.vis_layer_idx:  # Track inverse map
+                vis_feat = vis_feat[inverse]
+            layer_idx += 1
 
         # here point is down-sampled by GridSampling in default transform pipeline
         # feature of point cloud in original scale can be acquired by:
         _ = point.feat[point.inverse]
 
+        if args.vis_layer_idx == -1:  # Use last layer features
+            vis_feat = point.feat.clone().detach()
+
         # PCA
-        pca_color = get_pca_color(point.feat, brightness=1.2, center=True)
+        pca_color = get_pca_color(vis_feat, brightness=1.2, center=True)
 
     # Revert back to original coordinate frame
     if args.y_to_z_up:
